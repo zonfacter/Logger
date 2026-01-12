@@ -5,7 +5,7 @@ a = Analysis(
     ['Logger_rs232.py'],
     pathex=[],
     binaries=[],
-    datas=[('C:\\Anwendungens\\Python314\\tcl\\tcl8.6', 'tcl'), ('C:\\Anwendungens\\Python314\\tcl\\tk8.6', 'tk')],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
