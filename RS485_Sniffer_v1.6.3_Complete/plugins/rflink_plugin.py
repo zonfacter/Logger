@@ -351,6 +351,20 @@ class RFLinkPlugin(PluginBase):
         self.cmd_id = None
         self.cmd_switch = None
         self.cmd_action = None
+        self.log_widget = None  # Will be set in create_tab
+    
+    def log(self, message: str) -> None:
+        """Log message to plugin's log widget."""
+        if self.log_widget:
+            try:
+                self.log_widget.config(state='normal')
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                self.log_widget.insert('end', f"[{timestamp}] {message}\n")
+                self.log_widget.see('end')
+                self.log_widget.config(state='disabled')
+            except Exception:
+                pass
+        print(f"[RFLink] {message}")
     
     @property
     def info(self) -> PluginInfo:

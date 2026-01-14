@@ -199,7 +199,7 @@ class HausBusPlugin(PluginBase):
         self.payload_var = tk.StringVar()
         ttk.Entry(sf, textvariable=self.payload_var, width=30).grid(row=0, column=5, padx=5)
         
-        ttk.Button(sf, text="Senden", command=self.send_command).pack(side="right", padx=10, pady=5)
+        ttk.Button(sf, text="Senden", command=self.send_command).grid(row=0, column=6, padx=10, pady=5)
         
         self.schedule_refresh()
         return self.tab_frame

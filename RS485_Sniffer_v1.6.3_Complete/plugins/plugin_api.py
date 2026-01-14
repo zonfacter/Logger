@@ -16,6 +16,36 @@ import importlib.util
 
 
 @dataclass
+class DecodedFrame:
+    """Result of frame decoding by a plugin."""
+    valid: bool = False
+    protocol: str = ""
+    summary: str = ""
+    details: Dict[str, Any] = None
+    raw_bytes: bytes = b""
+    timestamp: str = ""
+    direction: str = ""  # RX or TX
+    
+    def __post_init__(self):
+        if self.details is None:
+            self.details = {}
+    
+    def __str__(self) -> str:
+        if self.valid:
+            return f"[{self.protocol}] {self.summary}"
+        return "Invalid frame"
+
+
+@dataclass
+class FrameField:
+    """Represents a field in a decoded frame."""
+    name: str
+    value: Any
+    raw_bytes: bytes = b""
+    description: str = ""
+
+
+@dataclass
 class PluginInfo:
     """Plugin metadata container."""
     name: str

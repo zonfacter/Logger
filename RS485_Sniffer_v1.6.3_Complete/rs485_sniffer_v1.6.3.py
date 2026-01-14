@@ -662,32 +662,79 @@ class PluginManager:
         self.plugins: Dict[str, PluginBase] = {}
     
     def discover_plugins(self) -> List[str]:
-        """Discover available plugins."""
+        """Discover available plugins (both single .py files and packages)."""
         found = []
-        plugin_path = Path(self.plugin_dir)
+        
+        # Handle EXE vs Script path
+        if getattr(sys, 'frozen', False):
+            # Running as compiled EXE
+            base_path = Path(sys.executable).parent
+        else:
+            # Running as script
+            base_path = Path(__file__).parent
+        
+        plugin_path = base_path / self.plugin_dir
+        logger.info(f"[PluginManager] Searching for plugins in: {plugin_path}")
         
         if not plugin_path.exists():
-            plugin_path.mkdir(parents=True, exist_ok=True)
+            logger.warning(f"[PluginManager] Plugin directory not found, creating: {plugin_path}")
+            try:
+                plugin_path.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.error(f"[PluginManager] Failed to create plugin dir: {e}")
+            return found
+        
+        # List all items for debugging
+        try:
+            items = list(plugin_path.iterdir())
+            logger.info(f"[PluginManager] Found {len(items)} items: {[i.name for i in items]}")
+        except Exception as e:
+            logger.error(f"[PluginManager] Error listing directory: {e}")
             return found
         
         for item in plugin_path.iterdir():
+            # Check for package (directory with __init__.py)
             if item.is_dir() and (item / "__init__.py").exists():
                 found.append(item.name)
+                logger.info(f"[PluginManager] Found plugin package: {item.name}")
+            # Check for single .py file (not __init__.py, not plugin_api.py)
+            elif item.is_file() and item.suffix == ".py":
+                if item.stem not in ("__init__", "plugin_api", "__pycache__"):
+                    if "_plugin" in item.stem or "plugin" in item.stem.lower():
+                        found.append(item.stem)
+                        logger.info(f"[PluginManager] Found plugin file: {item.name}")
+        
+        # Store the resolved path for load_plugin
+        self._resolved_plugin_path = plugin_path
         
         return found
     
     def load_plugin(self, name: str) -> Optional[PluginBase]:
         """Load a plugin by name."""
         try:
-            # Add plugin dir to path
-            plugin_path = str(Path(self.plugin_dir).absolute())
-            if plugin_path not in sys.path:
-                sys.path.insert(0, plugin_path)
+            # Use resolved path from discover_plugins or calculate it
+            if hasattr(self, '_resolved_plugin_path'):
+                plugin_path = self._resolved_plugin_path
+            else:
+                if getattr(sys, 'frozen', False):
+                    base_path = Path(sys.executable).parent
+                else:
+                    base_path = Path(__file__).parent
+                plugin_path = base_path / self.plugin_dir
             
-            # Also add parent dir for plugin_api imports
-            parent_path = str(Path(".").absolute())
-            if parent_path not in sys.path:
-                sys.path.insert(0, parent_path)
+            plugin_path_str = str(plugin_path.absolute())
+            
+            # IMPORTANT: Remove any old plugin_api from sys.modules to force reload from correct path
+            modules_to_remove = [m for m in sys.modules if 'plugin_api' in m]
+            for m in modules_to_remove:
+                del sys.modules[m]
+                logger.debug(f"[PluginManager] Removed cached module: {m}")
+            
+            # IMPORTANT: Ensure plugins folder is FIRST in sys.path (before any other paths)
+            if plugin_path_str in sys.path:
+                sys.path.remove(plugin_path_str)
+            sys.path.insert(0, plugin_path_str)
+            logger.info(f"[PluginManager] Plugin path (priority): {plugin_path_str}")
             
             # Import plugin module
             import importlib
@@ -825,6 +872,7 @@ class RS485SnifferGUI:
         # Display
         self.display_mode_var = tk.StringVar(value="hex")
         self.auto_scroll_var = tk.BooleanVar(value=True)
+        self.newline_mode_var = tk.StringVar(value="dots")  # dots, symbols, escape, hidden
         
         # Send
         self.send_var = tk.StringVar()
@@ -1427,8 +1475,15 @@ class RS485SnifferGUI:
         import subprocess
         import platform
         
-        plugins_path = Path("plugins").absolute()
+        # Handle EXE vs Script path
+        if getattr(sys, 'frozen', False):
+            base_path = Path(sys.executable).parent
+        else:
+            base_path = Path(__file__).parent
+        
+        plugins_path = base_path / "plugins"
         plugins_path.mkdir(exist_ok=True)
+        logger.info(f"[PluginManager] Opening plugins folder: {plugins_path}")
         
         try:
             if platform.system() == "Windows":
@@ -1897,7 +1952,7 @@ class RS485SnifferGUI:
         """Display received/sent data in terminal."""
         # Format data
         data_hex = format_bytes_hex(data)
-        data_ascii = format_bytes_ascii(data, self.config.newline_mode)
+        data_ascii = format_bytes_ascii(data, self.newline_mode_var.get())
         
         # Store in buffer for export
         self.terminal_buffer.append({
