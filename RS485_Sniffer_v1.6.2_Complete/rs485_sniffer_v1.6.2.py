@@ -733,6 +733,7 @@ class RS485SnifferGUI:
         # Display
         self.display_mode_var = tk.StringVar(value="hex")
         self.auto_scroll_var = tk.BooleanVar(value=True)
+        self.newline_mode_var = tk.StringVar(value="dots")  # dots, symbols, escape, hidden
         
         # Send
         self.send_var = tk.StringVar()
