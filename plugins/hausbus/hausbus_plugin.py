@@ -1,308 +1,427 @@
 """
-HausBus Plugin v1.0.0
-Dekodiert HausBus-Protokoll, Netzwerk-Scanner, Status-Abfrage
+HausBus Protocol Plugin v1.0.0
+Plugin for RS485 Sniffer to decode HausBus protocol frames.
 """
 
-import tkinter as tk
-from tkinter import ttk
-from typing import Optional, Dict, Any
-import sys
-import os
+from typing import Optional, Dict, Any, List, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+import struct
+import logging
 
-# Import plugin API from parent directory
-parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
+# Import from plugin API
+try:
+    from plugin_api import PluginBase, PluginInfo, DecodedFrame, FrameField
+except ImportError:
+    from .plugin_api import PluginBase, PluginInfo, DecodedFrame, FrameField
 
-from plugin_api import PluginBase, PluginInfo, ProtocolDecoder
+# Import protocol components
+try:
+    from protocol import (
+        HausBusProtocol, HausBusFrame, ObjectId, ClassId,
+        CLASS_NAMES, CLASS_FUNCTIONS, parse_params_for_class
+    )
+    from device_registry import DeviceRegistry, Device, DeviceObject
+except ImportError:
+    from .protocol import (
+        HausBusProtocol, HausBusFrame, ObjectId, ClassId,
+        CLASS_NAMES, CLASS_FUNCTIONS, parse_params_for_class
+    )
+    from .device_registry import DeviceRegistry, Device, DeviceObject
 
 
-class HausBusDecoder(ProtocolDecoder):
-    """HausBus Protocol Decoder"""
-    
-    COMMANDS = {
-        0x01: "GET_STATUS",
-        0x02: "SET_CFG",
-        0x03: "GET_CFG",
-        0x04: "SAVE_CFG",
-        0x05: "RESET",
-        0x10: "SCAN",
-        0x11: "PING",
-        0x12: "PONG",
-        0x20: "DATA",
-        0x21: "ACK",
-        0x22: "NACK",
-        0xFE: "BOOTLOADER",
-        0xFF: "BROADCAST",
-    }
-    
-    def __init__(self, start_byte: int = 0xFE):
-        self.start_byte = start_byte
-    
-    def decode(self, data: bytes) -> Optional[Dict[str, Any]]:
-        """Decode HausBus frame"""
-        if len(data) < 5:
-            return None
-        
-        if data[0] != self.start_byte:
-            return None
-        
-        length = data[1]
-        if len(data) < length + 2:
-            return None
-        
-        calc_checksum = sum(data[:-1]) & 0xFF
-        frame_checksum = data[-1]
-        
-        return {
-            "valid": calc_checksum == frame_checksum,
-            "start": data[0],
-            "length": length,
-            "dest_addr": data[2],
-            "src_addr": data[3],
-            "command": data[4],
-            "command_name": self.COMMANDS.get(data[4], f"CMD_{data[4]:02X}"),
-            "payload": data[5:-1] if len(data) > 6 else b"",
-            "checksum": frame_checksum,
-            "checksum_calc": calc_checksum,
-        }
-    
-    def encode(self, message: Dict[str, Any]) -> Optional[bytes]:
-        """Encode HausBus frame"""
-        dest = message.get("dest_addr", 0xFF)
-        src = message.get("src_addr", 0x00)
-        cmd = message.get("command", 0x10)
-        payload = message.get("payload", b"")
-        
-        if isinstance(payload, str):
-            payload = payload.encode("utf-8")
-        
-        length = 3 + len(payload)
-        frame = bytes([self.start_byte, length, dest, src, cmd]) + payload
-        checksum = sum(frame) & 0xFF
-        
-        return frame + bytes([checksum])
-    
-    def format_decoded(self, decoded: Dict[str, Any]) -> str:
-        if not decoded:
-            return ""
-        valid = "OK" if decoded["valid"] else "CRC!"
-        return (f"[HB {decoded['command_name']} "
-                f"D:{decoded['dest_addr']:02X} S:{decoded['src_addr']:02X} ({valid})]")
+LOGGER = logging.getLogger("plugin.hausbus")
 
 
 class HausBusPlugin(PluginBase):
-    """HausBus Integration Plugin"""
+    """
+    HausBus Protocol Plugin for RS485 Sniffer.
     
-    @property
-    def info(self) -> PluginInfo:
+    Decodes HausBus frames and provides device discovery,
+    command generation, and protocol analysis.
+    """
+    
+    @classmethod
+    def get_info(cls) -> PluginInfo:
         return PluginInfo(
-            name="HausBus",
+            name="HausBus Protocol",
             version="1.0.0",
-            author="HausBus Team",
-            description="HausBus Protokoll Decoder, Scanner und Konfigurator"
+            author="RS485 Sniffer Team",
+            description="Decoder for HausBus home automation protocol",
+            protocol_name="HausBus",
+            min_frame_size=13,
+            max_frame_size=256,
+            supports_encoding=True,
+            supports_device_discovery=True,
+            config_schema={
+                "show_raw_data": {
+                    "type": "bool",
+                    "default": False,
+                    "description": "Show raw hex data in decoded output"
+                },
+                "auto_discover": {
+                    "type": "bool",
+                    "default": True,
+                    "description": "Automatically discover devices from traffic"
+                },
+                "data_directory": {
+                    "type": "str",
+                    "default": "./hausbus_data",
+                    "description": "Directory for device registry data"
+                },
+                "sender_device_id": {
+                    "type": "int",
+                    "default": 9998,
+                    "description": "Device ID to use when sending commands"
+                }
+            }
         )
     
     def __init__(self):
         super().__init__()
-        self.decoder = HausBusDecoder()
-        self.devices: Dict[int, Dict] = {}
-        self.my_address = 0x00
-        self.tab_frame = None
-        self.tree = None
+        self._protocol: Optional[HausBusProtocol] = None
+        self._registry: Optional[DeviceRegistry] = None
+        self._config: Dict[str, Any] = {}
     
-    def on_load(self, gui, sniffer) -> bool:
-        self._gui = gui
-        self._sniffer = sniffer
-        self.devices = {}
-        print(f"[HausBus] Plugin v{self.info.version} geladen")
-        return True
-    
-    def on_unload(self) -> None:
-        self.devices.clear()
-        print("[HausBus] Plugin entladen")
-    
-    def on_start(self) -> None:
-        self.devices.clear()
-        if self.tree:
-            self.refresh_device_list()
-    
-    def on_frame_received(self, timestamp: str, data: bytes, formatted: str):
-        decoded = self.decoder.decode(data)
-        if decoded:
-            src = decoded["src_addr"]
-            if src != 0x00 and src != 0xFF:
-                if src not in self.devices:
-                    self.devices[src] = {
-                        "first_seen": timestamp,
-                        "rx_count": 0,
-                        "tx_count": 0,
-                        "last_cmd": "",
-                        "status": "Online"
-                    }
-                self.devices[src]["rx_count"] += 1
-                self.devices[src]["last_seen"] = timestamp
-                self.devices[src]["last_cmd"] = decoded["command_name"]
-            
-            extra = self.decoder.format_decoded(decoded)
-            return f"{formatted} {extra}"
-        return None
-    
-    def on_frame_sent(self, timestamp: str, data: bytes) -> None:
-        decoded = self.decoder.decode(data)
-        if decoded:
-            dest = decoded["dest_addr"]
-            if dest in self.devices:
-                self.devices[dest]["tx_count"] += 1
-    
-    def create_tab(self, notebook) -> tk.Frame:
-        self.tab_frame = ttk.Frame(notebook)
-        
-        lf = ttk.LabelFrame(self.tab_frame, text="Gefundene Geraete")
-        lf.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        cols = ("Adresse", "Status", "RX", "TX", "Letzter Befehl", "Zuletzt gesehen")
-        self.tree = ttk.Treeview(lf, columns=cols, show="headings", height=10)
-        
-        widths = [80, 80, 60, 60, 120, 120]
-        for col, w in zip(cols, widths):
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=w)
-        
-        sb = ttk.Scrollbar(lf, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        
-        bf = ttk.Frame(self.tab_frame)
-        bf.pack(fill="x", padx=10, pady=5)
-        
-        ttk.Button(bf, text="Netzwerk scannen", command=self.scan_network).pack(side="left", padx=5)
-        ttk.Button(bf, text="Ping", command=self.ping_selected).pack(side="left", padx=5)
-        ttk.Button(bf, text="Status abfragen", command=self.query_status).pack(side="left", padx=5)
-        ttk.Button(bf, text="Aktualisieren", command=self.refresh_device_list).pack(side="right", padx=5)
-        
-        sf = ttk.LabelFrame(self.tab_frame, text="Befehl senden")
-        sf.pack(fill="x", padx=10, pady=5)
-        
-        ttk.Label(sf, text="Ziel:").grid(row=0, column=0, padx=5, pady=5)
-        self.dest_var = tk.StringVar(value="FF")
-        ttk.Entry(sf, textvariable=self.dest_var, width=6).grid(row=0, column=1, padx=5)
-        
-        ttk.Label(sf, text="Befehl:").grid(row=0, column=2, padx=5)
-        self.cmd_var = tk.StringVar(value="GET_STATUS")
-        cmd_combo = ttk.Combobox(sf, textvariable=self.cmd_var, 
-                                  values=list(self.decoder.COMMANDS.values()), width=15)
-        cmd_combo.grid(row=0, column=3, padx=5)
-        
-        ttk.Label(sf, text="Payload (Hex):").grid(row=0, column=4, padx=5)
-        self.payload_var = tk.StringVar()
-        ttk.Entry(sf, textvariable=self.payload_var, width=30).grid(row=0, column=5, padx=5)
-        
-        ttk.Button(sf, text="Senden", command=self.send_command).grid(row=0, column=6, padx=10, pady=5)
-        
-        self.schedule_refresh()
-        return self.tab_frame
-    
-    def schedule_refresh(self):
-        if self.tab_frame and self.tab_frame.winfo_exists():
-            self.refresh_device_list()
-            self.tab_frame.after(2000, self.schedule_refresh)
-    
-    def refresh_device_list(self):
-        if not self.tree:
-            return
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        for addr, info in sorted(self.devices.items()):
-            self.tree.insert("", "end", values=(
-                f"0x{addr:02X}",
-                info.get("status", "?"),
-                info.get("rx_count", 0),
-                info.get("tx_count", 0),
-                info.get("last_cmd", ""),
-                info.get("last_seen", "")
-            ), tags=(str(addr),))
-    
-    def get_selected_address(self) -> Optional[int]:
-        sel = self.tree.selection()
-        if sel:
-            addr_str = self.tree.item(sel[0])["values"][0]
-            return int(addr_str, 16)
-        return None
-    
-    def scan_network(self):
-        frame = self.decoder.encode({
-            "dest_addr": 0xFF,
-            "src_addr": self.my_address,
-            "command": 0x10
-        })
-        self._send_frame(frame, "Netzwerk-Scan")
-    
-    def ping_selected(self):
-        addr = self.get_selected_address()
-        if addr:
-            frame = self.decoder.encode({
-                "dest_addr": addr,
-                "src_addr": self.my_address,
-                "command": 0x11
-            })
-            self._send_frame(frame, f"Ping an 0x{addr:02X}")
-    
-    def query_status(self):
-        addr = self.get_selected_address()
-        if addr:
-            frame = self.decoder.encode({
-                "dest_addr": addr,
-                "src_addr": self.my_address,
-                "command": 0x01
-            })
-            self._send_frame(frame, f"Status-Anfrage an 0x{addr:02X}")
-    
-    def send_command(self):
+    def initialize(self, config: Dict[str, Any]) -> bool:
+        """Initialize the plugin with configuration."""
         try:
-            dest = int(self.dest_var.get(), 16)
-        except:
-            if self._gui:
-                self._gui.queue_msg("[HausBus] Ungueltige Zieladresse")
-            return
-        
-        cmd_name = self.cmd_var.get()
-        cmd_code = 0x00
-        for code, name in self.decoder.COMMANDS.items():
-            if name == cmd_name:
-                cmd_code = code
-                break
-        
-        payload = b""
-        payload_hex = self.payload_var.get().replace(" ", "")
-        if payload_hex:
+            self._config = config
+            
+            sender_id = config.get("sender_device_id", 9998)
+            self._protocol = HausBusProtocol(sender_device_id=sender_id)
+            
+            if config.get("auto_discover", True):
+                from pathlib import Path
+                data_dir = Path(config.get("data_directory", "./hausbus_data"))
+                self._registry = DeviceRegistry(data_dir=data_dir)
+            
+            LOGGER.info(f"HausBus plugin initialized with sender_id={sender_id}")
+            return True
+            
+        except Exception as e:
+            LOGGER.exception(f"Failed to initialize HausBus plugin: {e}")
+            return False
+    
+    def shutdown(self) -> None:
+        """Cleanup on shutdown."""
+        if self._registry:
             try:
-                payload = bytes.fromhex(payload_hex)
-            except:
-                if self._gui:
-                    self._gui.queue_msg("[HausBus] Ungueltiger Payload")
-                return
+                self._registry.save_devices()
+            except Exception as e:
+                LOGGER.exception(f"Error saving device registry: {e}")
+    
+    def can_decode(self, data: bytes) -> Tuple[bool, float]:
+        """
+        Check if data looks like a HausBus frame.
+        Returns (can_decode, confidence).
+        """
+        if len(data) < 13:
+            return False, 0.0
         
-        frame = self.decoder.encode({
-            "dest_addr": dest,
-            "src_addr": self.my_address,
-            "command": cmd_code,
-            "payload": payload
-        })
-        self._send_frame(frame, f"{cmd_name} an 0x{dest:02X}")
+        confidence = 0.3
+        
+        control_byte = data[0]
+        if control_byte <= 0x0F:
+            confidence += 0.1
+        
+        try:
+            data_length = struct.unpack("<H", data[10:12])[0]
+            expected_total = 12 + data_length
+            
+            if len(data) == expected_total:
+                confidence += 0.3
+            elif len(data) >= expected_total:
+                confidence += 0.2
+        except:
+            pass
+        
+        if len(data) >= 6:
+            sender_class = data[5]
+            if sender_class in CLASS_NAMES:
+                confidence += 0.2
+        
+        if len(data) >= 10:
+            receiver_class = data[9]
+            if receiver_class in CLASS_NAMES:
+                confidence += 0.1
+        
+        return confidence >= 0.5, min(confidence, 1.0)
     
-    def _send_frame(self, frame: bytes, description: str):
-        if frame and self._sniffer and self._sniffer.ser and self._sniffer.ser.is_open:
-            self._sniffer.ser.write(frame)
-            if self._gui:
-                self._gui.queue_msg(f"[HausBus] {description} gesendet")
-        else:
-            if self._gui:
-                self._gui.queue_msg("[HausBus] Port nicht offen!")
+    def decode(self, data: bytes, timestamp: Optional[datetime] = None) -> Optional[DecodedFrame]:
+        """Decode a HausBus frame."""
+        if self._protocol is None:
+            return None
+        
+        frame = self._protocol.decode(data)
+        if frame is None:
+            return None
+        
+        if not frame.valid:
+            return DecodedFrame(
+                protocol="HausBus",
+                valid=False,
+                error_message=frame.error_msg,
+                raw_data=data,
+                timestamp=timestamp or datetime.now()
+            )
+        
+        if self._registry and self._config.get("auto_discover", True):
+            try:
+                self._registry.update_device_from_frame(
+                    frame.sender, frame.function_id, frame.params
+                )
+            except Exception as e:
+                LOGGER.debug(f"Registry update error: {e}")
+        
+        fields = [
+            FrameField("Control", f"0x{frame.control_byte:02X}", 0, 1),
+            FrameField("MsgCounter", str(frame.msg_counter), 1, 1),
+            FrameField("Sender", str(frame.sender), 2, 4),
+            FrameField("Receiver", str(frame.receiver), 6, 4),
+            FrameField("DataLength", str(frame.data_length), 10, 2),
+            FrameField("Function", f"{frame.function_name} (0x{frame.function_id:02X})", 12, 1),
+        ]
+        
+        if frame.params:
+            parsed = parse_params_for_class(
+                frame.sender.class_id, frame.function_id, frame.params
+            )
+            if parsed:
+                params_str = ", ".join(f"{k}={v}" for k, v in parsed.items())
+            else:
+                params_str = frame.params.hex(" ").upper()
+            fields.append(FrameField("Params", params_str, 13, len(frame.params)))
+        
+        summary = f"{frame.function_type}: {frame.sender} -> {frame.receiver} [{frame.function_name}]"
+        
+        return DecodedFrame(
+            protocol="HausBus",
+            valid=True,
+            summary=summary,
+            fields=fields,
+            raw_data=data,
+            timestamp=timestamp or datetime.now(),
+            metadata={
+                "frame_type": frame.function_type,
+                "sender_device": frame.sender.device_id,
+                "receiver_device": frame.receiver.device_id,
+                "sender_class": frame.sender.class_name,
+                "receiver_class": frame.receiver.class_name,
+                "function_id": frame.function_id,
+                "function_name": frame.function_name,
+            }
+        )
     
-    def get_config(self) -> dict:
-        return {"my_address": self.my_address}
+    def encode(self, command: str, params: Dict[str, Any]) -> Optional[bytes]:
+        """
+        Encode a command to HausBus frame.
+        
+        Supported commands:
+        - ping: {device_id: int}
+        - get_module_id: {device_id: int, index: int}
+        - get_remote_objects: {device_id: int}
+        - get_configuration: {device_id: int, class_id: int, instance_id: int}
+        - dimmer_set_brightness: {device_id: int, instance_id: int, brightness: int, duration: int}
+        - rgb_set_color: {device_id: int, instance_id: int, red: int, green: int, blue: int, duration: int}
+        - shutter_command: {device_id: int, instance_id: int, command: str, position: int}
+        """
+        if self._protocol is None:
+            return None
+        
+        try:
+            if command == "ping":
+                return self._protocol.create_ping(
+                    device_id=params["device_id"],
+                    instance_id=params.get("instance_id", 1)
+                )
+            
+            elif command == "get_module_id":
+                return self._protocol.create_get_module_id(
+                    device_id=params["device_id"],
+                    index=params.get("index", 0)
+                )
+            
+            elif command == "get_remote_objects":
+                return self._protocol.create_get_remote_objects(
+                    device_id=params["device_id"]
+                )
+            
+            elif command == "get_configuration":
+                return self._protocol.create_get_configuration(
+                    device_id=params["device_id"],
+                    class_id=params["class_id"],
+                    instance_id=params["instance_id"]
+                )
+            
+            elif command == "dimmer_set_brightness":
+                return self._protocol.create_dimmer_set_brightness(
+                    device_id=params["device_id"],
+                    instance_id=params["instance_id"],
+                    brightness=params["brightness"],
+                    duration=params.get("duration", 0)
+                )
+            
+            elif command == "rgb_set_color":
+                return self._protocol.create_rgb_set_color(
+                    device_id=params["device_id"],
+                    instance_id=params["instance_id"],
+                    red=params["red"],
+                    green=params["green"],
+                    blue=params["blue"],
+                    duration=params.get("duration", 0)
+                )
+            
+            elif command == "shutter_command":
+                return self._protocol.create_shutter_command(
+                    device_id=params["device_id"],
+                    instance_id=params["instance_id"],
+                    command=params["command"],
+                    position=params.get("position", 0)
+                )
+            
+            elif command == "raw":
+                receiver = ObjectId(
+                    device_id=params["device_id"],
+                    class_id=params["class_id"],
+                    instance_id=params["instance_id"]
+                )
+                raw_params = bytes.fromhex(params.get("params_hex", ""))
+                return self._protocol.encode(
+                    receiver=receiver,
+                    function_id=params["function_id"],
+                    params=raw_params
+                )
+            
+            else:
+                LOGGER.warning(f"Unknown command: {command}")
+                return None
+                
+        except KeyError as e:
+            LOGGER.error(f"Missing parameter for command '{command}': {e}")
+            return None
+        except Exception as e:
+            LOGGER.exception(f"Error encoding command '{command}': {e}")
+            return None
     
-    def set_config(self, config: dict):
-        self.my_address = config.get("my_address", 0x00)
+    def get_available_commands(self) -> List[Dict[str, Any]]:
+        """Return list of available commands with their parameters."""
+        return [
+            {
+                "name": "ping",
+                "description": "Ping a device",
+                "params": {"device_id": "int"}
+            },
+            {
+                "name": "get_module_id",
+                "description": "Get module identification",
+                "params": {"device_id": "int", "index": "int (optional)"}
+            },
+            {
+                "name": "get_remote_objects",
+                "description": "Discover all objects on a device",
+                "params": {"device_id": "int"}
+            },
+            {
+                "name": "get_configuration",
+                "description": "Get object configuration",
+                "params": {"device_id": "int", "class_id": "int", "instance_id": "int"}
+            },
+            {
+                "name": "dimmer_set_brightness",
+                "description": "Set dimmer brightness",
+                "params": {
+                    "device_id": "int",
+                    "instance_id": "int",
+                    "brightness": "int (0-200)",
+                    "duration": "int (optional, ms)"
+                }
+            },
+            {
+                "name": "rgb_set_color",
+                "description": "Set RGB color",
+                "params": {
+                    "device_id": "int",
+                    "instance_id": "int",
+                    "red": "int (0-255)",
+                    "green": "int (0-255)",
+                    "blue": "int (0-255)",
+                    "duration": "int (optional, ms)"
+                }
+            },
+            {
+                "name": "shutter_command",
+                "description": "Control shutter",
+                "params": {
+                    "device_id": "int",
+                    "instance_id": "int",
+                    "command": "str (moveUp/moveDown/stop/setPosition)",
+                    "position": "int (optional, 0-100)"
+                }
+            },
+        ]
+    
+    def get_discovered_devices(self) -> List[Dict[str, Any]]:
+        """Return list of discovered devices."""
+        if self._registry is None:
+            return []
+        
+        result = []
+        for device in self._registry.get_all_devices():
+            result.append({
+                "device_id": device.device_id,
+                "name": device.name or device.module_name or f"Device {device.device_id}",
+                "firmware": device.firmware_version,
+                "online": device.online,
+                "last_seen": device.last_seen.isoformat(),
+                "object_count": device.object_count,
+                "objects": [
+                    {
+                        "class_id": obj.object_id.class_id,
+                        "class_name": obj.class_name,
+                        "instance_id": obj.object_id.instance_id,
+                        "name": obj.name,
+                        "last_event": obj.last_event,
+                    }
+                    for obj in device.objects.values()
+                ]
+            })
+        return result
+    
+    def get_device_details(self, device_id: int) -> Optional[Dict[str, Any]]:
+        """Get detailed information about a specific device."""
+        if self._registry is None:
+            return None
+        
+        device = self._registry.get_device(device_id)
+        if device is None:
+            return None
+        
+        return device.to_dict()
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Return plugin statistics."""
+        stats = {
+            "protocol": "HausBus",
+            "version": self.get_info().version,
+        }
+        
+        if self._registry:
+            devices = self._registry.get_all_devices()
+            stats["total_devices"] = len(devices)
+            stats["online_devices"] = sum(1 for d in devices if d.online)
+            stats["total_objects"] = sum(d.object_count for d in devices)
+            
+            class_counts: Dict[str, int] = {}
+            for device in devices:
+                for obj in device.objects.values():
+                    name = obj.class_name
+                    class_counts[name] = class_counts.get(name, 0) + 1
+            stats["objects_by_class"] = class_counts
+        
+        return stats
+
+
+def get_plugin_class():
+    """Entry point for plugin discovery."""
+    return HausBusPlugin
